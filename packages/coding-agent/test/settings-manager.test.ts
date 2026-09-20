@@ -559,6 +559,19 @@ describe("SettingsManager", () => {
 			expect(SettingsManager.create(projectDir, agentDir).getMermaidRenderingMode()).toBe("streaming");
 		});
 	});
+	describe("simpleMainRender", () => {
+		it("defaults to enabled and persists explicit changes", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(settingsPath, JSON.stringify({ theme: "dark" }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getSimpleMainRender()).toBe(true);
+			manager.setSimpleMainRender(false);
+			await manager.flush();
+			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			expect(savedSettings.simpleMainRender).toBe(false);
+			expect(savedSettings.theme).toBe("dark");
+		});
+	});
 
 	describe("shellCommandPrefix", () => {
 		it("should load shellCommandPrefix from settings", () => {

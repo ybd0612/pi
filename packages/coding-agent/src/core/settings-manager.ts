@@ -121,6 +121,7 @@ export interface Settings {
 	branchSummary?: BranchSummarySettings;
 	retry?: RetrySettings;
 	hideThinkingBlock?: boolean;
+	simpleMainRender?: boolean;
 	showCacheMissNotices?: boolean; // default: false - show cache cost and provider recovery notices
 	externalEditor?: string; // Command for Ctrl+G external editor; takes precedence over VISUAL/EDITOR
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows); supports leading ~ expansion
@@ -421,8 +422,13 @@ export class SettingsManager {
 		if (!content) {
 			return {};
 		}
-		const settings = JSON.parse(stripBom(content));
-		return SettingsManager.migrateSettings(settings);
+		try {
+			const settings = JSON.parse(stripBom(content)) as unknown;
+			if (typeof settings !== "object" || settings === null || Array.isArray(settings)) return {};
+			return SettingsManager.migrateSettings(settings as Record<string, unknown>);
+		} catch (error) {
+			throw new Error(`Invalid ${scope} settings JSON`, { cause: error });
+		}
 	}
 
 	private static tryLoadFromStorage(
@@ -434,6 +440,15 @@ export class SettingsManager {
 			return { settings: SettingsManager.loadFromStorage(storage, scope, projectTrusted), error: null };
 		} catch (error) {
 			return { settings: {}, error: error as Error };
+		}
+	}
+	private static parseSettingsJson(content: string, scope: SettingsScope): Settings {
+		try {
+			const parsed = JSON.parse(stripBom(content)) as unknown;
+			if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+			return SettingsManager.migrateSettings(parsed as Record<string, unknown>);
+		} catch (error) {
+			throw new Error(`Invalid ${scope} settings JSON`, { cause: error });
 		}
 	}
 
@@ -641,9 +656,7 @@ export class SettingsManager {
 		modifiedNestedFields: Map<keyof Settings, Set<string>>,
 	): void {
 		this.storage.withLock(scope, (current) => {
-			const currentFileSettings = current
-				? SettingsManager.migrateSettings(JSON.parse(stripBom(current)) as Record<string, unknown>)
-				: {};
+			const currentFileSettings = current ? SettingsManager.parseSettingsJson(current, scope) : {};
 			const mergedSettings: Settings = { ...currentFileSettings };
 			for (const field of modifiedFields) {
 				const value = snapshotSettings[field];
@@ -975,6 +988,10 @@ export class SettingsManager {
 		return parseTimeoutSetting(this.settings.websocketConnectTimeoutMs, "websocketConnectTimeoutMs");
 	}
 
+	getSimpleMainRender(): boolean {
+		return this.settings.simpleMainRender ?? true;
+	}
+
 	getHideThinkingBlock(): boolean {
 		return this.settings.hideThinkingBlock ?? false;
 	}
@@ -993,6 +1010,12 @@ export class SettingsManager {
 			return environmentEditor;
 		}
 		return process.platform === "win32" ? "notepad" : "nano";
+	}
+
+	setSimpleMainRender(enabled: boolean): void {
+		this.globalSettings.simpleMainRender = enabled;
+		this.markModified("simpleMainRender");
+		this.save();
 	}
 
 	setHideThinkingBlock(hide: boolean): void {

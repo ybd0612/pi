@@ -23,6 +23,7 @@ export interface AppKeybindings {
 	"app.model.select": true;
 	"app.tools.expand": true;
 	"app.thinking.toggle": true;
+	"app.main.toggleSimpleRender": true;
 	"app.session.toggleNamedFilter": true;
 	"app.editor.external": true;
 	"app.message.copy": true;
@@ -119,6 +120,7 @@ export const KEYBINDINGS = {
 		defaultKeys: "ctrl+t",
 		description: "Toggle thinking blocks",
 	},
+	"app.main.toggleSimpleRender": { defaultKeys: [], description: "Toggle compact main rendering" },
 	"app.session.toggleNamedFilter": {
 		defaultKeys: "ctrl+n",
 		description: "Toggle named session filter",

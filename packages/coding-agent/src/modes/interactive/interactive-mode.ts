@@ -122,7 +122,6 @@ import { checkForNewPiVersion, type LatestPiRelease } from "../../utils/version-
 import { reportBug } from "./bug-report.ts";
 import { createChatViewport } from "./chat-viewport.ts";
 import { ArminComponent } from "./components/armin.ts";
-import { AssistantMessageComponent } from "./components/assistant-message.ts";
 import { BashExecutionComponent } from "./components/bash-execution.ts";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.ts";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.ts";
@@ -158,7 +157,6 @@ import {
 	WorkingStatusIndicator,
 } from "./components/status-indicator.ts";
 import { ThinkingSelectorComponent } from "./components/thinking-selector.ts";
-import { ToolExecutionComponent } from "./components/tool-execution.ts";
 import { TreeSelectorComponent } from "./components/tree-selector.ts";
 import { TrustSelectorComponent } from "./components/trust-selector.ts";
 import { UserMessageComponent } from "./components/user-message.ts";
@@ -166,6 +164,13 @@ import { UserMessageSelectorComponent } from "./components/user-message-selector
 import { editInExternalEditor } from "./external-editor.ts";
 import { refreshModelCatalogs } from "./model-catalog-refresh.ts";
 import { getModelSearchText } from "./model-search.ts";
+import {
+	type AssistantMessageRenderer,
+	createMainAreaRenderer,
+	type MainAreaRendererFactory,
+	type MainAreaRendererSelection,
+	type ToolExecutionRenderer,
+} from "./renderers.ts";
 import { shareSession } from "./session-share.ts";
 import {
 	getAvailableThemes,
@@ -424,6 +429,8 @@ export class InteractiveMode {
 	private workingMessage: string | undefined = undefined;
 	private workingVisible = true;
 	private workingIndicatorOptions: WorkingIndicatorOptions | undefined = undefined;
+	private toolProgressStartedAt: number | undefined;
+	private toolProgressTimer: ReturnType<typeof setInterval> | undefined;
 	private readonly defaultWorkingMessage = "Working";
 	private readonly defaultHiddenThinkingLabel = "Thinking...";
 	private hiddenThinkingLabel = this.defaultHiddenThinkingLabel;
@@ -440,11 +447,11 @@ export class InteractiveMode {
 	private managedToolStatusStarted = false;
 
 	// Streaming message tracking
-	private streamingComponent: AssistantMessageComponent | undefined = undefined;
+	private streamingComponent: AssistantMessageRenderer | undefined = undefined;
 	private streamingMessage: AssistantMessage | undefined = undefined;
-
-	// Tool execution tracking: toolCallId -> component
-	private pendingTools = new Map<string, ToolExecutionComponent>();
+	private readonly mainAreaRendererFactory: MainAreaRendererFactory;
+	private mainAreaRenderer: MainAreaRendererSelection;
+	private pendingTools = new Map<string, ToolExecutionRenderer>();
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
@@ -593,6 +600,20 @@ export class InteractiveMode {
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
 		this.outputPad = this.settingsManager.getOutputPad();
 
+		this.mainAreaRendererFactory = (simple) =>
+			createMainAreaRenderer(simple, {
+				ui: this.ui,
+				cwd: this.sessionManager.getCwd(),
+				markdownTheme: this.getMarkdownThemeWithSettings(),
+				hideThinkingBlock: this.hideThinkingBlock,
+				hiddenThinkingLabel: this.hiddenThinkingLabel,
+				outputPad: this.outputPad,
+				markdownTransformers: this.getMarkdownTransformers(),
+				showImages: this.settingsManager.getShowImages(),
+				imageWidthCells: this.settingsManager.getImageWidthCells(),
+				getToolDefinition: (name) => this.getRegisteredToolDefinition(name),
+			});
+		this.mainAreaRenderer = this.mainAreaRendererFactory(this.settingsManager.getSimpleMainRender());
 		// Register themes from resource loader and initialize
 		setRegisteredThemes(this.session.resourceLoader.getThemes().themes);
 		this.themeController = new InteractiveThemeController(this.ui, {
@@ -2086,6 +2107,22 @@ export class InteractiveMode {
 		return withBuiltInRenderers(toolName, this.session.getToolDefinition(toolName));
 	}
 
+	private createAssistantRenderer(message?: AssistantMessage): AssistantMessageRenderer {
+		return this.mainAreaRenderer.createAssistant(message);
+	}
+
+	private createToolRenderer(toolName: string, toolCallId: string, args: unknown): ToolExecutionRenderer {
+		const component = this.mainAreaRenderer.createTool(toolName, toolCallId, args);
+		component.setExpanded(this.toolOutputExpanded);
+		return component;
+	}
+	private toggleSimpleMainRender(): void {
+		const enabled = !this.settingsManager.getSimpleMainRender();
+		this.settingsManager.setSimpleMainRender(enabled);
+		this.mainAreaRenderer = this.mainAreaRendererFactory(enabled);
+		this.rebuildChatFromMessages();
+		this.showStatus(`简洁主区域：${enabled ? "开启" : "关闭"}`);
+	}
 	private getMarkdownTransformers(): MarkdownTransformer[] {
 		return [this.mermaidMarkdownTransformer, ...this.session.extensionRunner.getMarkdownTransformers()];
 	}
@@ -2192,6 +2229,7 @@ export class InteractiveMode {
 			clearedIndicator &&
 			!clearedIndicatorWasEmbedded &&
 			this.options.tuiMode === "regular" &&
+			!this.mainAreaRenderer.simple &&
 			this.ui.getClearOnShrink()
 		) {
 			this.statusContainer.addChild(this.idleStatus);
@@ -2211,6 +2249,46 @@ export class InteractiveMode {
 				colorFn,
 			),
 		);
+	}
+
+	private setToolProgress(toolName: string, args: unknown): void {
+		if (!this.mainAreaRenderer.simple) return;
+		const details = this.formatToolProgress(toolName, args);
+		this.workingMessage = `正在执行：${details}`;
+		if (this.activeStatusIndicator?.kind === "working") {
+			this.activeStatusIndicator.setMessage(this.workingMessage);
+		} else if (this.workingVisible) {
+			this.showWorkingStatusIndicator();
+		}
+		this.toolProgressStartedAt = Date.now();
+		if (this.toolProgressTimer) clearInterval(this.toolProgressTimer);
+		this.toolProgressTimer = setInterval(() => {
+			if (this.activeStatusIndicator?.kind !== "working" || this.toolProgressStartedAt === undefined) return;
+			const elapsed = Math.floor((Date.now() - this.toolProgressStartedAt) / 1000);
+			this.activeStatusIndicator.setMessage(`${this.workingMessage} · ${elapsed}s`);
+			this.ui.requestRender();
+		}, 1000);
+		this.ui.requestRender();
+	}
+
+	private clearToolProgress(): void {
+		if (this.toolProgressTimer) clearInterval(this.toolProgressTimer);
+		this.toolProgressTimer = undefined;
+		this.toolProgressStartedAt = undefined;
+		this.workingMessage = undefined;
+	}
+
+	private formatToolProgress(toolName: string, args: unknown): string {
+		if (typeof args === "object" && args !== null && "command" in args && typeof args.command === "string") {
+			return `${toolName} ${args.command.slice(0, 80)}`;
+		}
+		let text: string;
+		try {
+			text = typeof args === "string" ? args : JSON.stringify(args);
+		} catch {
+			text = "参数处理中";
+		}
+		return `${toolName}${text ? ` ${text.slice(0, 80)}` : ""}`;
 	}
 
 	private setWorkingVisible(visible: boolean): void {
@@ -2237,8 +2315,8 @@ export class InteractiveMode {
 	private setHiddenThinkingLabel(label?: string): void {
 		this.hiddenThinkingLabel = label ?? this.defaultHiddenThinkingLabel;
 		for (const child of this.chatContainer.children) {
-			if (child instanceof AssistantMessageComponent) {
-				child.setHiddenThinkingLabel(this.hiddenThinkingLabel);
+			if ("setHiddenThinkingLabel" in child) {
+				(child as AssistantMessageRenderer).setHiddenThinkingLabel(this.hiddenThinkingLabel);
 			}
 		}
 		if (this.streamingComponent) {
@@ -2948,6 +3026,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.suspend", () => this.handleCtrlZ());
 		this.defaultEditor.onAction("app.thinking.cycle", () => this.cycleThinkingLevel());
 		this.defaultEditor.onAction("app.model.cycleForward", () => this.cycleModel("forward"));
+		this.defaultEditor.onAction("app.main.toggleSimpleRender", () => this.toggleSimpleMainRender());
 		this.defaultEditor.onAction("app.model.cycleBackward", () => this.cycleModel("backward"));
 
 		// Global debug handler on TUI (works regardless of focus)
@@ -3255,7 +3334,9 @@ export class InteractiveMode {
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(true);
 				}
-				if (this.workingVisible) {
+				if (this.mainAreaRenderer.simple) {
+					this.clearStatusIndicator("working");
+				} else if (this.workingVisible) {
 					if (this.activeStatusIndicator?.kind !== "working") {
 						this.showWorkingStatusIndicator();
 					}
@@ -3300,14 +3381,7 @@ export class InteractiveMode {
 					this.updatePendingMessagesDisplay();
 					this.ui.requestRender();
 				} else if (event.message.role === "assistant") {
-					this.streamingComponent = new AssistantMessageComponent(
-						undefined,
-						this.hideThinkingBlock,
-						this.getMarkdownThemeWithSettings(),
-						this.hiddenThinkingLabel,
-						this.outputPad,
-						this.getMarkdownTransformers(),
-					);
+					this.streamingComponent = this.createAssistantRenderer();
 					this.streamingMessage = event.message;
 					this.chatContainer.addChild(this.streamingComponent);
 					this.streamingComponent.updateContent(this.streamingMessage, true);
@@ -3323,18 +3397,7 @@ export class InteractiveMode {
 					for (const content of this.streamingMessage.content) {
 						if (content.type === "toolCall") {
 							if (!this.pendingTools.has(content.id)) {
-								const component = new ToolExecutionComponent(
-									content.name,
-									content.id,
-									content.arguments,
-									{
-										showImages: this.settingsManager.getShowImages(),
-										imageWidthCells: this.settingsManager.getImageWidthCells(),
-									},
-									this.getRegisteredToolDefinition(content.name),
-									this.ui,
-									this.sessionManager.getCwd(),
-								);
+								const component = this.createToolRenderer(content.name, content.id, content.arguments);
 								component.setExpanded(this.toolOutputExpanded);
 								this.chatContainer.addChild(component);
 								this.pendingTools.set(content.id, component);
@@ -3399,23 +3462,13 @@ export class InteractiveMode {
 			case "tool_execution_start": {
 				let component = this.pendingTools.get(event.toolCallId);
 				if (!component) {
-					component = new ToolExecutionComponent(
-						event.toolName,
-						event.toolCallId,
-						event.args,
-						{
-							showImages: this.settingsManager.getShowImages(),
-							imageWidthCells: this.settingsManager.getImageWidthCells(),
-						},
-						this.getRegisteredToolDefinition(event.toolName),
-						this.ui,
-						this.sessionManager.getCwd(),
-					);
+					component = this.createToolRenderer(event.toolName, event.toolCallId, event.args);
 					component.setExpanded(this.toolOutputExpanded);
 					this.chatContainer.addChild(component);
 					this.pendingTools.set(event.toolCallId, component);
 				}
 				component.markExecutionStarted();
+				this.setToolProgress(event.toolName, event.args);
 				this.ui.requestRender();
 				break;
 			}
@@ -3434,12 +3487,13 @@ export class InteractiveMode {
 				if (component) {
 					component.updateResult({ ...event.result, isError: event.isError });
 					this.pendingTools.delete(event.toolCallId);
-					this.ui.requestRender();
+					this.clearToolProgress();
 				}
 				break;
 			}
 
 			case "agent_end":
+				this.clearToolProgress();
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(false);
 				}
@@ -3740,14 +3794,7 @@ export class InteractiveMode {
 				break;
 			}
 			case "assistant": {
-				const assistantComponent = new AssistantMessageComponent(
-					message,
-					this.hideThinkingBlock,
-					this.getMarkdownThemeWithSettings(),
-					this.hiddenThinkingLabel,
-					this.outputPad,
-					this.getMarkdownTransformers(),
-				);
+				const assistantComponent = this.createAssistantRenderer(message);
 				this.chatContainer.addChild(assistantComponent);
 				break;
 			}
@@ -3766,9 +3813,9 @@ export class InteractiveMode {
 		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
 	): void {
 		this.pendingTools.clear();
-		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
-		// Cache misses are not persisted, unlike successful cache-warming usage.
-		// Re-derive them and inject them after the assistant messages that paid for them.
+		const renderedPendingTools = new Map<string, ToolExecutionRenderer>();
+		// Cache-miss notices are not persisted; re-derive them from the full entry
+		// list and re-inject them after the assistant messages that paid for them.
 		const cacheMisses = this.settingsManager.getShowCacheMissNotices()
 			? collectCacheMisses(this.sessionManager.getEntries(), this.session.modelRuntime)
 			: new Map<AssistantMessage, CacheMiss>();
@@ -3799,18 +3846,7 @@ export class InteractiveMode {
 				// Render tool call components
 				for (const content of message.content) {
 					if (content.type === "toolCall") {
-						const component = new ToolExecutionComponent(
-							content.name,
-							content.id,
-							content.arguments,
-							{
-								showImages: this.settingsManager.getShowImages(),
-								imageWidthCells: this.settingsManager.getImageWidthCells(),
-							},
-							this.getRegisteredToolDefinition(content.name),
-							this.ui,
-							this.sessionManager.getCwd(),
-						);
+						const component = this.createToolRenderer(content.name, content.id, content.arguments);
 						component.setExpanded(this.toolOutputExpanded);
 						this.chatContainer.addChild(component);
 
@@ -4335,8 +4371,8 @@ export class InteractiveMode {
 	/** Update rendered assistant messages without rebuilding live tool components. */
 	private updateThinkingBlockVisibility(): void {
 		for (const child of this.chatContainer.children) {
-			if (child instanceof AssistantMessageComponent) {
-				child.setHideThinkingBlock(this.hideThinkingBlock);
+			if ("setHideThinkingBlock" in child) {
+				(child as AssistantMessageRenderer).setHideThinkingBlock(this.hideThinkingBlock);
 			}
 		}
 		this.ui.requestRender();
@@ -4714,16 +4750,16 @@ export class InteractiveMode {
 					onShowImagesChange: (enabled) => {
 						this.settingsManager.setShowImages(enabled);
 						for (const child of this.chatContainer.children) {
-							if (child instanceof ToolExecutionComponent) {
-								child.setShowImages(enabled);
+							if ("setShowImages" in child) {
+								(child as ToolExecutionRenderer).setShowImages(enabled);
 							}
 						}
 					},
 					onImageWidthCellsChange: (width) => {
 						this.settingsManager.setImageWidthCells(width);
 						for (const child of this.chatContainer.children) {
-							if (child instanceof ToolExecutionComponent) {
-								child.setImageWidthCells(width);
+							if ("setImageWidthCells" in child) {
+								(child as ToolExecutionRenderer).setImageWidthCells(width);
 							}
 						}
 					},
@@ -4830,11 +4866,9 @@ export class InteractiveMode {
 						this.outputPad = padding;
 						if (this.streamingComponent || this.session.isStreaming) {
 							for (const child of this.chatContainer.children) {
-								if (
-									child instanceof AssistantMessageComponent ||
-									child instanceof CustomMessageComponent ||
-									child instanceof UserMessageComponent
-								) {
+								if ("setOutputPad" in child) {
+									(child as AssistantMessageRenderer).setOutputPad(padding);
+								} else if (child instanceof CustomMessageComponent || child instanceof UserMessageComponent) {
 									child.setOutputPad(padding);
 								}
 							}
